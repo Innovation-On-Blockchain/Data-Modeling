@@ -14,11 +14,12 @@ This notebook bridges that gap:
 
 1. Loads raw transactions and OFAC sanction labels from the Rust pipeline
 2. Filters out smart contract addresses using the pipeline's `nodes.parquet` metadata
-3. Maps Ethereum addresses to contiguous integer IDs (0-indexed)
-4. Converts timestamps to relative seconds and values from wei to ETH
-5. Labels edges as illicit if either endpoint is OFAC-sanctioned
-6. Produces three output files in the exact format IBM Multi-GNN expects
-7. Creates an 80/20 temporal train/validation split
+3. Prunes low-degree EOAs to reduce the graph from ~30M to ~889K nodes, preserving all sanctioned addresses, their 1-hop counterparties, and hub nodes (top 0.1% by total degree)
+4. Maps Ethereum addresses to contiguous integer IDs (0-indexed)
+5. Converts timestamps to relative seconds and values from wei to ETH
+6. Labels edges as illicit if either endpoint is OFAC-sanctioned
+7. Produces three output files in the exact format IBM Multi-GNN expects
+8. Creates an 80/20 temporal train/validation split
 
 ---
 
@@ -30,12 +31,12 @@ Rust Pipeline Outputs                   This Notebook                       GNN 
 
   transactions_raw.parquet ──┐
         (90.7M rows)         │
-                             ├──► Load ──► Filter Contracts ──► Map IDs ──► Convert ──► Label ──► Split
+                             ├──► Load ──► Filter Contracts ──► Prune EOAs ──► Map IDs ──► Convert ──► Label ──► Split
   labels.parquet ────────────┤
-        (82 addresses)       │                                        │
-                             │                                        ├──► formatted_transactions.parquet
-  nodes.parquet ─────────────┘                                        ├──► node_labels.parquet
-     (33.9M nodes,                                                    └──► data_splits.json
+        (82 addresses)       │                                                       │
+                             │                                                       ├──► formatted_transactions.parquet
+  nodes.parquet ─────────────┘                                                       ├──► node_labels.parquet
+     (33.9M nodes,                                                                   └──► data_splits.json
       is_contract flag)
 ```
 
@@ -87,13 +88,24 @@ These are produced by the [Data-Preprocessing-For-AML](https://github.com/Innova
 
 ## Processing Steps
 
-The notebook (`Modeling_and_preprocessing.ipynb`) performs 8 sequential steps:
+The notebook (`Modeling_and_preprocessing.ipynb`) performs 9 sequential steps:
 
 ### Step 1: Filter Contract Addresses
 
 Loads `nodes.parquet` and extracts all addresses where `is_contract == True` (721,891 contracts identified by the Rust pipeline via `eth_getCode` RPC calls and BigQuery lookup). Removes every transaction where **either** `from_address` or `to_address` is a contract.
 
 This ensures the output graph contains only EOA-to-EOA transactions. Contract addresses (DEX routers, bridges, multisig wallets) are structural intermediaries that would dominate the graph topology and obscure the signal from sanctioned EOA addresses.
+
+### Step 1.5: Prune Low-Degree EOAs
+
+After contract filtering, approximately 30 million EOA addresses remain — far too many for full-graph GNN training. This step prunes low-degree EOAs by computing an automatic degree threshold that brings the graph to approximately 1 million nodes.
+
+Three categories of nodes are protected and never pruned:
+1. **Sanctioned addresses** — all 82 OFAC-labeled addresses
+2. **1-hop counterparties** — direct transaction partners of sanctioned addresses
+3. **Hub nodes** — addresses in the top 0.1% by total degree (from `nodes.parquet`)
+
+All other EOAs with total degree (in-degree + out-degree) below the computed threshold are removed, along with any edges touching them. This reduces the graph from ~30M to 889,615 nodes while preserving the local neighborhood structure that GNN message-passing depends on.
 
 ### Step 2: Create Address-to-ID Mapping
 
@@ -206,13 +218,17 @@ Update the paths in Cell 2:
 | OFAC-sanctioned addresses | 82 (from labels.parquet) |
 | Time span | 2015-08-07 to 2026-02-19 |
 
-### After Contract Filtering (output)
+### After Contract Filtering and EOA Pruning (output)
 
-Exact counts depend on the run. Filtering removes all transactions where either endpoint is a contract address. Expected impact:
+| Metric | Value |
+|--------|-------|
+| EOA nodes | 889,615 |
+| Directed edges | 23,082,561 |
+| OFAC-sanctioned nodes | 69 |
+| Train edges (80%) | 18,466,048 |
+| Validation edges (20%) | 4,616,513 |
 
-- Transactions: reduced (edges touching contracts are removed)
-- Unique nodes: reduced to EOAs only
-- Sanctioned nodes: 75 (7 sanctioned addresses had no EOA-to-EOA transactions)
+Contract filtering removes all transactions where either endpoint is a contract address (7 sanctioned addresses had no EOA-to-EOA transactions, reducing 82 to 75). Subsequent EOA pruning removes low-degree nodes while preserving sanctioned addresses, their 1-hop counterparties, and hub nodes, further reducing 75 sanctioned nodes to 69 in the final graph.
 
 ### Edge Label Distribution
 
